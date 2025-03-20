@@ -5,7 +5,7 @@ from typing import List
 
 class ServerStateEnum(Enum):
     """
-    Predefined server state identifiers for UDS diagnostic sessions.
+    Predefined server state identifiers for UDS diagnostic sessions. Placeholders for correct state logic.
     """
     DEFAULT_SESSION = 0x01
     EXTENDED_DIAGNOSTIC = 0x03
