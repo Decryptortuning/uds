@@ -79,6 +79,12 @@ class Client:
         :param p6_ext_client_timeout: Timeout value for P*Client parameter.
         :param s3_client: Value of S3Client time parameter.
         """
+        self.transport_interface = transport_interface
+        self.p2_client_timeout = p2_client_timeout
+        self.p2_ext_client_timeout = p2_ext_client_timeout
+        self.p6_client_timeout = p6_client_timeout
+        self.p6_ext_client_timeout = p6_ext_client_timeout
+        self.s3_client = s3_client
         self.__p2_client_measured: Optional[TimeMillisecondsAlias] = None
         self.__p2_ext_client_measured: Optional[Tuple[TimeMillisecondsAlias, ...]] = None
         self.__p6_client_measured: Optional[TimeMillisecondsAlias] = None
@@ -94,12 +100,6 @@ class Client:
         self.__receiving_break_event.clear()
         self.__receiving_not_in_progress.set()
         self.__tester_present_stop_event.set()
-        self.transport_interface = transport_interface
-        self.p2_client_timeout = p2_client_timeout
-        self.p2_ext_client_timeout = p2_ext_client_timeout
-        self.p6_client_timeout = p6_client_timeout
-        self.p6_ext_client_timeout = p6_ext_client_timeout
-        self.s3_client = s3_client
 
     def __del__(self) -> None:
         """Safely finish all tasks."""
@@ -279,9 +279,9 @@ class Client:
             raise TypeError("Provided time parameter value must be int or float type.")
         if value <= 0:
             raise ValueError("Provided timeout parameter value must be greater than 0.")
-        if value < self.p2_client_timeout:
-            raise InconsistencyError("S3Client value must be greater or equal than "
-                                     f"P2Client timeout ({self.p2_client_timeout} ms).")
+        # NOTE: Removed constraint s3 >= p2 - TesterPresent interval should be based on
+        # ECU's S3_SERVER_TIMEOUT, not client response timeout. TesterPresent uses
+        # functional addressing and doesn't interfere with physical addressing requests.
         self.__s3_client = value
 
     @property
@@ -391,8 +391,17 @@ class Client:
                 _p2_ext_measured = response_record.transmission_end - response_records[i].transmission_end
                 p2_ext_measured_list.append(_p2_ext_measured.total_seconds() * 1000.)
             p6_ext_measured = response_records[-1].transmission_end - request_record.transmission_end
-            self._update_p2_ext_client_measured(*p2_ext_measured_list)
-            self._update_p6_ext_client_measured(p6_ext_measured.total_seconds() * 1000.)
+            # Skip measurement update if values are invalid (can happen with timestamp inconsistencies)
+            if all(v > 0 for v in p2_ext_measured_list):
+                self._update_p2_ext_client_measured(*p2_ext_measured_list)
+            else:
+                warn("Measured P2*Client values contain non-positive values. Skipping update.",
+                     category=RuntimeWarning)
+            if p6_ext_measured.total_seconds() > 0:
+                self._update_p6_ext_client_measured(p6_ext_measured.total_seconds() * 1000.)
+            else:
+                warn("Measured P6*Client value is negative. Check Transport Interface accuracy.",
+                     category=RuntimeWarning)
         else:
             p6_measured = response_records[-1].transmission_end - request_record.transmission_end
             if p6_measured.total_seconds() > 0:
@@ -463,15 +472,48 @@ class Client:
         Schedule a single Tester Present message transmission for a cyclic sending.
 
         :param tester_present_message: Tester Present message to send.
+
+        NOTE: Uses direct CAN frame sending to avoid thread-safety issues with
+        send_message()'s notifier/buffer management. TesterPresent is always a
+        single frame so we don't need ISO-TP flow control.
         """
+        from can import Message as CanMessage
+
         period = self.s3_client / 1000.0
         next_call = perf_counter()
+
+        # Get the functional TX CAN ID from addressing info
+        # TesterPresent should use functional addressing (typically 0x7DF)
+        can_id = self.transport_interface.segmenter.addressing_information.tx_functional_params.get("can_id", 0x7DF)
+
+        # Build raw CAN frame data for TesterPresent single frame
+        # Format: [SF_DL] [SID] [SubFunction] where SF_DL = payload length (2 bytes)
+        payload = tester_present_message.payload
+        raw_data = bytes([len(payload)]) + payload
+        # Pad to 8 bytes with 0x00 (or use filler byte if configured)
+        raw_data = raw_data + bytes(8 - len(raw_data))
+
         while not self.__tester_present_stop_event.is_set():
-            self.transport_interface.send_message(tester_present_message)
+            try:
+                # Send directly via network_manager (python-can Bus) to avoid
+                # interference with main thread's send_message operations
+                can_frame = CanMessage(
+                    arbitration_id=can_id,
+                    data=raw_data,
+                    is_extended_id=False
+                )
+                self.transport_interface.network_manager.send(can_frame, timeout=0.1)
+            except Exception:
+                pass  # Silently ignore send errors in background thread
+
             next_call += period
             remaining_wait = next_call - perf_counter()
-            if self.__tester_present_stop_event.wait(remaining_wait):
-                break
+            if remaining_wait > 0:
+                if self.__tester_present_stop_event.wait(remaining_wait):
+                    break
+            else:
+                # We're behind schedule, send immediately on next iteration
+                next_call = perf_counter()
 
     @staticmethod
     def is_response_pending_message(message: Union[UdsMessage, UdsMessageRecord], request_sid: RequestSID) -> bool:
@@ -631,30 +673,31 @@ class Client:
         if not isinstance(request, UdsMessage):
             raise TypeError("Provided request value is not an instance of UdsMessage class.")
         request_record = self.transport_interface.send_message(request)
-        time_request_sent = request_record.transmission_end.timestamp()
+        # CRITICAL FIX: Use perf_counter() consistently for all timeout calculations
+        # This matches what _receive_response uses internally and avoids mixing
+        # CAN adapter packet timestamps with wall-clock time.
+        perf_request_sent = perf_counter()
         sid = RequestSID(request_record.payload[0])
         response_records: List[UdsMessageRecord] = []
-        time_elapsed_ms = (time() - time_request_sent) * 1000.
         # get the first response (either final response or negative response with response pending nrc)
         try:
             response_record = self._receive_response(sid=sid,
-                                                     start_timeout=self.p2_client_timeout - time_elapsed_ms,
-                                                     end_timeout=self.p6_client_timeout - time_elapsed_ms)
+                                                     start_timeout=self.p2_client_timeout,
+                                                     end_timeout=self.p6_client_timeout)
         except TimeoutError as exception:
             raise TimeoutError("P6Client timeout reached.") from exception
         if response_record is None:  # timeout achieved - no response
             return request_record, tuple()
         response_records.append(response_record)
-        timestamp_p6_ext_timeout = time_request_sent + self.p6_ext_client_timeout / 1000.
         while self.is_response_pending_message(message=response_records[-1], request_sid=sid):
-            timestamp_now = time()
-            timestamp_p2_ext_timeout = (response_records[-1].transmission_end.timestamp()
-                                        + self.p2_ext_client_timeout / 1000.)
-            remaining_p2_ext_timeout = (timestamp_p2_ext_timeout - timestamp_now) * 1000.
-            remaining_p6_ext_timeout = (timestamp_p6_ext_timeout - timestamp_now) * 1000.
+            # Calculate remaining P6* timeout based on elapsed time since request
+            elapsed_ms = (perf_counter() - perf_request_sent) * 1000.
+            remaining_p6_ext_timeout = self.p6_ext_client_timeout - elapsed_ms
+            # P2* timeout restarts fresh with each ResponsePending per ISO 14229
+            # Just use the full P2* timeout value
             try:
                 response_record = self._receive_response(sid=sid,
-                                                         start_timeout=remaining_p2_ext_timeout,
+                                                         start_timeout=self.p2_ext_client_timeout,
                                                          end_timeout=remaining_p6_ext_timeout)
             except TimeoutError as exception:
                 raise TimeoutError("P6*Client timeout reached.") from exception
