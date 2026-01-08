@@ -1,8 +1,8 @@
-""":ref:`ReadMemoryByAddress (SID 0x23) <knowledge-base-service-read-memory-by-address>` translation."""
+"""Translation for ReadMemoryByAddress (SID 0x23) service."""
 
 __all__ = ["READ_MEMORY_BY_ADDRESS"]
 
-from uds.message import RequestSID
+from uds.message import NRC, RequestSID
 
 from ..data_record_definitions import ADDRESS_AND_LENGTH_FORMAT_IDENTIFIER, CONDITIONAL_MEMORY_ADDRESS_AND_SIZE, DATA
 from ..service import Service
@@ -10,5 +10,12 @@ from ..service import Service
 READ_MEMORY_BY_ADDRESS = Service(request_sid=RequestSID.ReadMemoryByAddress,
                                  request_structure=(ADDRESS_AND_LENGTH_FORMAT_IDENTIFIER,
                                                     CONDITIONAL_MEMORY_ADDRESS_AND_SIZE),
-                                 response_structure=(DATA,))
+                                 response_structure=(DATA,),
+                                 supported_nrc=(
+                                     NRC.IncorrectMessageLengthOrInvalidFormat,
+                                     NRC.ResponseTooLong,
+                                     NRC.ConditionsNotCorrect,
+                                     NRC.RequestOutOfRange,
+                                     NRC.SecurityAccessDenied,
+                                 ))
 """Default translator for :ref:`ReadMemoryByAddress <knowledge-base-service-read-memory-by-address>` service."""
