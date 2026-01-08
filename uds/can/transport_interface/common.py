@@ -41,6 +41,10 @@ class AbstractCanTransportInterface(AbstractTransportInterface, ABC):
     (:ref:`Flow Status <knowledge-base-can-flow-status>`,
     :ref:`Block Size <knowledge-base-can-block-size>`,
     :ref:`Separation Time minimum <knowledge-base-can-st-min>`)."""
+    DEFAULT_N_WFT_MAX: Optional[int] = None
+    """Default value for N_WFTmax - maximum consecutive FC.WAIT frames before abort.
+    None or 0 means FC.WAIT is not supported (fail on first WAIT).
+    Positive integer is the maximum consecutive WAITs allowed."""
 
     def __init__(self,
                  network_manager: Any,
@@ -54,6 +58,7 @@ class AbstractCanTransportInterface(AbstractTransportInterface, ABC):
                  flow_control_parameters_generator: AbstractFlowControlParametersGenerator
                  = DEFAULT_FLOW_CONTROL_PARAMETERS,
                  can_version: CanVersion = CanVersion.CLASSIC_CAN,
+                 n_wft_max: Optional[int] = DEFAULT_N_WFT_MAX,
                  **segmenter_configuration: Any) -> None:
         """
         Create Transport Interface (an object for handling UDS Transport and Network layers).
@@ -69,6 +74,9 @@ class AbstractCanTransportInterface(AbstractTransportInterface, ABC):
         :param n_cs: Value of :ref:`N_Cs <knowledge-base-can-n-cs>` time parameter to use in communication.
         :param flow_control_parameters_generator: Generator with Flow Control parameters to use.
         :param can_version: Version of CAN protocol to be used for packets sending.
+        :param n_wft_max: Maximum number of consecutive FC.WAIT frames to accept before aborting transmission.
+            - None or 0: FC.WAIT is not supported (fail immediately on first WAIT)
+            - Positive integer: Maximum consecutive WAITs allowed before N_WFTmax abort
         :param segmenter_configuration: Configuration parameters for CAN Segmenter.
 
             - :parameter dlc: Base CAN DLC value to use for CAN packets.
@@ -92,6 +100,7 @@ class AbstractCanTransportInterface(AbstractTransportInterface, ABC):
         self.flow_control_parameters_generator = flow_control_parameters_generator
         self.segmenter = CanSegmenter(addressing_information=addressing_information, **segmenter_configuration)
         self.can_version = can_version
+        self.n_wft_max = n_wft_max
 
     # General
 
@@ -232,6 +241,38 @@ class AbstractCanTransportInterface(AbstractTransportInterface, ABC):
         if not isinstance(value, AbstractFlowControlParametersGenerator):
             raise TypeError("Provided Flow Control parameters generator value has incorrect type.")
         self.__flow_control_parameters_generator = value
+
+    @property
+    def n_wft_max(self) -> Optional[int]:
+        """
+        Maximum number of consecutive FC.WAIT frames to accept before aborting transmission.
+
+        Per ISO 15765-2, the sender may receive FC.WAIT frames indicating the receiver is temporarily
+        unable to receive more data. This parameter limits how many consecutive WAITs are accepted.
+
+        - None or 0: FC.WAIT is not supported (transmission aborts on first WAIT)
+        - Positive integer: Maximum consecutive WAITs allowed before N_WFTmax abort
+        """
+        return self.__n_wft_max
+
+    @n_wft_max.setter
+    def n_wft_max(self, value: Optional[int]) -> None:
+        """
+        Set maximum number of consecutive FC.WAIT frames to accept.
+
+        :param value: Value to set.
+            - None or 0: FC.WAIT not supported (fail on first WAIT)
+            - Positive integer: Max consecutive WAITs before abort
+
+        :raise TypeError: Provided value is not None or int type.
+        :raise ValueError: Provided value is negative.
+        """
+        if value is not None:
+            if not isinstance(value, int):
+                raise TypeError("n_wft_max must be None or int type.")
+            if value < 0:
+                raise ValueError("n_wft_max cannot be negative.")
+        self.__n_wft_max = value
 
     # Time parameter - CAN Network Layer
 

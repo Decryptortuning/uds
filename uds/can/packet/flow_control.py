@@ -347,10 +347,16 @@ def extract_flow_status(addressing_format: CanAddressingFormat, raw_frame_data: 
     :param addressing_format: CAN Addressing Format used.
     :param raw_frame_data: Raw data bytes of a CAN frame.
 
+    :raise InconsistencyError: N_INVALID_FS - reserved Flow Status value (0x3-0xF) received.
+
     :return: Flow Status value carried by the provided Flow Control data.
     """
     ai_data_bytes_number = CanAddressingInformation.get_ai_data_bytes_number(addressing_format)
-    return CanFlowStatus(raw_frame_data[ai_data_bytes_number] & 0xF)
+    raw_fs = raw_frame_data[ai_data_bytes_number] & 0xF
+    try:
+        return CanFlowStatus(raw_fs)
+    except ValueError:
+        raise InconsistencyError(f"N_INVALID_FS: reserved Flow Status value 0x{raw_fs:X} received")
 
 
 def extract_block_size(addressing_format: CanAddressingFormat, raw_frame_data: RawBytesAlias) -> int:

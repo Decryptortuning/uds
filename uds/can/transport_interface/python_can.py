@@ -17,6 +17,8 @@ from can import Notifier
 from uds.addressing import AddressingType, TransmissionDirection
 from uds.message import UdsMessage, UdsMessageRecord
 from uds.utilities import (
+    IgnorePacketError,
+    InconsistencyError,
     MessageTransmissionNotStartedError,
     NewMessageReceptionWarning,
     TimeMillisecondsAlias,
@@ -26,7 +28,18 @@ from uds.utilities import (
 
 from ..addressing import AbstractCanAddressingInformation
 from ..frame import CanDlcHandler, CanIdHandler, CanVersion
-from ..packet import CanFlowStatus, CanPacket, CanPacketRecord, CanPacketType, CanSTminTranslator
+from ..packet import (
+    CanFlowStatus,
+    CanPacket,
+    CanPacketRecord,
+    CanPacketType,
+    CanSTminTranslator,
+    extract_flow_status,
+    get_flow_control_min_dlc,
+    validate_consecutive_frame_data,
+    validate_first_frame_data,
+    validate_single_frame_data,
+)
 from .common import AbstractCanTransportInterface
 
 
@@ -46,6 +59,7 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
     def __init__(self,
                  network_manager: BusABC,
                  addressing_information: AbstractCanAddressingInformation,
+                 log_file: Optional[str] = None,
                  **configuration_params: Any) -> None:
         """
         Create Transport Interface that uses python-can package to control CAN bus.
@@ -53,6 +67,8 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         :param network_manager: Python-can bus object for handling CAN network.
         :param addressing_information: Addressing Information configuration of a simulated node that is taking part in
             DoCAN communication.
+        :param log_file: Optional path to CSV file for logging CAN traffic. If provided, all TX/RX
+            frames will be logged with timestamps.
         :param configuration_params: Additional configuration parameters.
 
             - :parameter n_as_timeout: Timeout value for :ref:`N_As <knowledge-base-can-n-as>` time parameter.
@@ -81,6 +97,11 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         # listeners for receiving FC packets when sending messages
         self.__tx_frames_buffer = BufferedReader()
         self.__async_tx_frames_buffer = AsyncBufferedReader()
+        # CAN traffic logging
+        self._log_file_handle = None
+        self._log_start_time: Optional[float] = None
+        if log_file:
+            self._setup_logging(log_file)
 
     def __del__(self) -> None:
         """Safely close all threads opened by this object."""
@@ -90,6 +111,35 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         self.__async_rx_frames_buffer.stop()
         self.__tx_frames_buffer.stop()
         self.__async_tx_frames_buffer.stop()
+        self._close_logging()
+
+    def _setup_logging(self, log_file: str) -> None:
+        """Initialize CAN traffic logging to a CSV file."""
+        self._log_file_handle = open(log_file, 'w')
+        self._log_start_time = time()
+        self._log_file_handle.write(f"# CAN Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        self._log_file_handle.write("# Elapsed(s),Dir,ArbID,Data\n")
+        self._log_file_handle.flush()
+
+    def _close_logging(self) -> None:
+        """Close the log file if open."""
+        if self._log_file_handle is not None:
+            self._log_file_handle.close()
+            self._log_file_handle = None
+
+    def _log_frame(self, arbitration_id: int, data: bytes, direction: str) -> None:
+        """Log a CAN frame to the log file.
+
+        :param arbitration_id: CAN arbitration ID.
+        :param data: Frame data bytes.
+        :param direction: 'TX' or 'RX'.
+        """
+        if self._log_file_handle is None or self._log_start_time is None:
+            return
+        elapsed = time() - self._log_start_time
+        data_hex = ' '.join(f'{b:02X}' for b in data)
+        self._log_file_handle.write(f"{elapsed:.6f},{direction},0x{arbitration_id:03X},{data_hex}\n")
+        self._log_file_handle.flush()
 
     def __teardown_notifier(self, suppress_warning: bool = False) -> None:
         """
@@ -218,16 +268,31 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
 
         :param last_packet_transmission_time: Moment of time when the last CAN Packet was transmitted.
 
+        :raise InconsistencyError: N_INVALID_FS - reserved Flow Status value received.
+
         :return: Record with historic information about received Flow Control CAN packet.
         """
-        packet_record = None
         timestamp_timeout = last_packet_transmission_time.timestamp() + self.n_bs_timeout / 1000.
-        while (packet_record is None
-               or packet_record.addressing_type != AddressingType.PHYSICAL
-               or packet_record.packet_type != CanPacketType.FLOW_CONTROL):
+        while True:
             remaining_time_ms = (timestamp_timeout - time()) * 1000.
             packet_record = self._wait_for_packet(buffer=self.__tx_frames_buffer, timeout=remaining_time_ms)
-        return packet_record
+            # Must be physical addressing and FC type
+            if (packet_record.addressing_type != AddressingType.PHYSICAL
+                    or packet_record.packet_type != CanPacketType.FLOW_CONTROL):
+                continue
+            # Check DLC first - ignore if too small per ISO 15765-2
+            min_dlc = get_flow_control_min_dlc(addressing_format=self.segmenter.addressing_format)
+            actual_dlc = CanDlcHandler.encode_dlc(len(packet_record.raw_frame_data))
+            if actual_dlc < min_dlc:
+                warn(f"Ignoring FC with DLC too small: {actual_dlc} < {min_dlc}",
+                     category=UnexpectedPacketReceptionWarning)
+                continue  # Keep waiting for valid FC within N_Bs timeout
+            # Validate FS - abort if invalid (reserved value)
+            # extract_flow_status raises InconsistencyError for N_INVALID_FS
+            extract_flow_status(
+                addressing_format=self.segmenter.addressing_format,
+                raw_frame_data=packet_record.raw_frame_data)
+            return packet_record
 
     async def _async_wait_for_flow_control(self, last_packet_transmission_time: datetime) -> CanPacketRecord:
         """
@@ -235,17 +300,32 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
 
         :param last_packet_transmission_time: Moment of time when the last CAN Packet was transmitted.
 
+        :raise InconsistencyError: N_INVALID_FS - reserved Flow Status value received.
+
         :return: Record with historic information about received Flow Control CAN packet.
         """
-        packet_record = None
         timestamp_timeout = last_packet_transmission_time.timestamp() + self.n_bs_timeout / 1000.
-        while (packet_record is None
-               or packet_record.addressing_type != AddressingType.PHYSICAL
-               or packet_record.packet_type != CanPacketType.FLOW_CONTROL):
+        while True:
             remaining_time_ms = (timestamp_timeout - time()) * 1000.
             packet_record = await self._async_wait_for_packet(buffer=self.__async_tx_frames_buffer,
                                                               timeout=remaining_time_ms)
-        return packet_record
+            # Must be physical addressing and FC type
+            if (packet_record.addressing_type != AddressingType.PHYSICAL
+                    or packet_record.packet_type != CanPacketType.FLOW_CONTROL):
+                continue
+            # Check DLC first - ignore if too small per ISO 15765-2
+            min_dlc = get_flow_control_min_dlc(addressing_format=self.segmenter.addressing_format)
+            actual_dlc = CanDlcHandler.encode_dlc(len(packet_record.raw_frame_data))
+            if actual_dlc < min_dlc:
+                warn(f"Ignoring FC with DLC too small: {actual_dlc} < {min_dlc}",
+                     category=UnexpectedPacketReceptionWarning)
+                continue  # Keep waiting for valid FC within N_Bs timeout
+            # Validate FS - abort if invalid (reserved value)
+            # extract_flow_status raises InconsistencyError for N_INVALID_FS
+            extract_flow_status(
+                addressing_format=self.segmenter.addressing_format,
+                raw_frame_data=packet_record.raw_frame_data)
+            return packet_record
 
     def _wait_for_packet(self,
                          buffer: BufferedReader,
@@ -274,6 +354,7 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                     raise TimeoutError("Timeout was reached before a CAN packet was received.")
             received_frame = buffer.get_message(timeout=timeout_left_s)
             if received_frame is not None:
+                self._log_frame(received_frame.arbitration_id, received_frame.data, 'RX')
                 packet_addressing_type = self.addressing_information.is_input_packet(
                     can_id=received_frame.arbitration_id,
                     raw_frame_data=received_frame.data)
@@ -314,6 +395,7 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
             except (TimeoutError, AsyncioTimeoutError):
                 pass
             else:
+                self._log_frame(received_frame.arbitration_id, received_frame.data, 'RX')
                 packet_addressing_type = self.addressing_information.is_input_packet(
                     can_id=received_frame.arbitration_id,
                     raw_frame_data=received_frame.data)
@@ -373,12 +455,27 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                 return self._message_receive_start(initial_packet=received_packet,
                                                    timestamp_end=timestamp_end)
             # handle following Consecutive Frame
-            if (received_packet.packet_type == CanPacketType.CONSECUTIVE_FRAME
-                    and received_packet.sequence_number == sequence_number):
-                timestamp_start = perf_counter()
-                received_cf.append(received_packet)
-                received_payload_size += len(received_packet.payload)  # type: ignore
-                sequence_number = (received_packet.sequence_number + 1) & 0xF
+            if received_packet.packet_type == CanPacketType.CONSECUTIVE_FRAME:
+                # Validate CF DLC per ISO 15765-2 (ignore if DLC too small)
+                try:
+                    validate_consecutive_frame_data(
+                        addressing_format=self.segmenter.addressing_format,
+                        raw_frame_data=received_packet.raw_frame_data)
+                except (ValueError, InconsistencyError):
+                    # DLC too small - ignore this CF, keep waiting for valid one
+                    warn("Ignoring Consecutive Frame with invalid DLC",
+                         category=UnexpectedPacketReceptionWarning)
+                    continue
+                if received_packet.sequence_number == sequence_number:
+                    timestamp_start = perf_counter()
+                    received_cf.append(received_packet)
+                    received_payload_size += len(received_packet.payload)  # type: ignore
+                    sequence_number = (received_packet.sequence_number + 1) & 0xF
+                else:
+                    # N_WRONG_SN - abort reception per ISO 15765-2
+                    raise InconsistencyError(
+                        f"N_WRONG_SN: expected SN={sequence_number}, "
+                        f"received SN={received_packet.sequence_number}")
         return tuple(received_cf)
 
     async def _async_receive_cf_packets_block(self,
@@ -431,12 +528,27 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                                                                timestamp_end=timestamp_end,
                                                                loop=loop)
             # handle following Consecutive Frame
-            if (received_packet.packet_type == CanPacketType.CONSECUTIVE_FRAME
-                    and received_packet.sequence_number == sequence_number):
-                timestamp_start = perf_counter()
-                received_cf.append(received_packet)
-                received_payload_size += len(received_packet.payload)  # type: ignore
-                sequence_number = (received_packet.sequence_number + 1) & 0xF
+            if received_packet.packet_type == CanPacketType.CONSECUTIVE_FRAME:
+                # Validate CF DLC per ISO 15765-2 (ignore if DLC too small)
+                try:
+                    validate_consecutive_frame_data(
+                        addressing_format=self.segmenter.addressing_format,
+                        raw_frame_data=received_packet.raw_frame_data)
+                except (ValueError, InconsistencyError):
+                    # DLC too small - ignore this CF, keep waiting for valid one
+                    warn("Ignoring Consecutive Frame with invalid DLC",
+                         category=UnexpectedPacketReceptionWarning)
+                    continue
+                if received_packet.sequence_number == sequence_number:
+                    timestamp_start = perf_counter()
+                    received_cf.append(received_packet)
+                    received_payload_size += len(received_packet.payload)  # type: ignore
+                    sequence_number = (received_packet.sequence_number + 1) & 0xF
+                else:
+                    # N_WRONG_SN - abort reception per ISO 15765-2
+                    raise InconsistencyError(
+                        f"N_WRONG_SN: expected SN={sequence_number}, "
+                        f"received SN={received_packet.sequence_number}")
         return tuple(received_cf)
 
     def _receive_consecutive_frames(self,
@@ -458,12 +570,13 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         received_data_length: int = len(first_frame.payload)  # type: ignore
         sequence_number: int = 1
         flow_control_iterator = iter(self.flow_control_parameters_generator)
+        last_packet_perf_time = perf_counter()  # Use monotonic clock for N_Br timing
         while True:
             if timestamp_end is not None:
                 remaining_end_timeout_ms = (timestamp_end - perf_counter()) * 1000.
                 if remaining_end_timeout_ms < 0:
                     raise TimeoutError("Total message reception timeout was reached.")
-            time_elapsed_ms = (time() - packets_records[-1].transmission_time.timestamp()) * 1000.
+            time_elapsed_ms = (perf_counter() - last_packet_perf_time) * 1000.
             remaining_n_br_timeout_ms = self.n_br - time_elapsed_ms
             if remaining_n_br_timeout_ms > 0:
                 try:
@@ -482,6 +595,7 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                                                                block_size=block_size,
                                                                st_min=st_min)
             packets_records.append(self.send_packet(fc_packet))
+            last_packet_perf_time = perf_counter()  # Update after sending FC
             if flow_status == CanFlowStatus.Overflow:
                 raise OverflowError("Flow Control with Flow Status `OVERFLOW` was transmitted.")
             if flow_status == CanFlowStatus.ContinueToSend:
@@ -492,7 +606,16 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                                                           timestamp_end=timestamp_end)
                 if isinstance(cf_block, UdsMessageRecord):  # handle in case another message interrupted
                     return cf_block
+                # CAN-FD consistency check (warning only)
+                expected_is_fd = first_frame.frame.is_fd
+                for cf in cf_block:
+                    if cf.frame.is_fd != expected_is_fd:
+                        warn(f"CAN version mismatch in multi-frame transfer: FF is_fd={expected_is_fd}, "
+                             f"CF is_fd={cf.frame.is_fd}",
+                             category=UnexpectedPacketReceptionWarning)
+                        break  # Only warn once per block
                 packets_records.extend(cf_block)
+                last_packet_perf_time = perf_counter()  # Update after receiving CF block
                 received_data_length += len(cf_block[0].payload) * len(cf_block)  # type: ignore
                 if received_data_length >= message_data_length:
                     break
@@ -522,12 +645,13 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         received_data_length: int = len(first_frame.payload)  # type: ignore
         sequence_number: int = 1
         flow_control_iterator = iter(self.flow_control_parameters_generator)
+        last_packet_perf_time = perf_counter()  # Use monotonic clock for N_Br timing
         while True:
             if timestamp_end is not None:
                 remaining_end_timeout_ms = (timestamp_end - perf_counter()) * 1000.
                 if remaining_end_timeout_ms < 0:
                     raise TimeoutError("Total message reception timeout was reached.")
-            time_elapsed_ms = (time() - packets_records[-1].transmission_time.timestamp()) * 1000.
+            time_elapsed_ms = (perf_counter() - last_packet_perf_time) * 1000.
             remaining_n_br_timeout_ms = self.n_br - time_elapsed_ms
             if remaining_n_br_timeout_ms > 0:
                 try:
@@ -547,6 +671,7 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                                                                block_size=block_size,
                                                                st_min=st_min)
             packets_records.append(await self.async_send_packet(fc_packet, loop=loop))
+            last_packet_perf_time = perf_counter()  # Update after sending FC
             if flow_status == CanFlowStatus.Overflow:
                 raise OverflowError("Flow Control with Flow Status `OVERFLOW` was transmitted.")
             if flow_status == CanFlowStatus.ContinueToSend:
@@ -558,7 +683,16 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                                                                       loop=loop)
                 if isinstance(cf_block, UdsMessageRecord):  # handle in case another message interrupted
                     return cf_block
+                # CAN-FD consistency check (warning only)
+                expected_is_fd = first_frame.frame.is_fd
+                for cf in cf_block:
+                    if cf.frame.is_fd != expected_is_fd:
+                        warn(f"CAN version mismatch in multi-frame transfer: FF is_fd={expected_is_fd}, "
+                             f"CF is_fd={cf.frame.is_fd}",
+                             category=UnexpectedPacketReceptionWarning)
+                        break  # Only warn once per block
                 packets_records.extend(cf_block)
+                last_packet_perf_time = perf_counter()  # Update after receiving CF block
                 received_data_length += len(cf_block[0].payload) * len(cf_block)  # type: ignore
                 if received_data_length >= message_data_length:
                     break
@@ -575,12 +709,36 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         :param timestamp_end: The final timestamp till when the reception must be completed.
 
         :raise NotImplementedError: Unhandled CAN packet starting a new CAN message transmission was received.
+        :raise IgnorePacketError: Invalid SF/FF that should be silently ignored per ISO 15765-2.
 
         :return: Record of UDS message received.
         """
         if initial_packet.packet_type == CanPacketType.SINGLE_FRAME:
+            # Validate SF data per ISO 15765-2
+            try:
+                validate_single_frame_data(
+                    addressing_format=self.segmenter.addressing_format,
+                    raw_frame_data=initial_packet.raw_frame_data)
+            except (ValueError, InconsistencyError) as e:
+                warn(f"Ignoring invalid Single Frame (DLC error): {e}",
+                     category=UnexpectedPacketReceptionWarning)
+                raise IgnorePacketError(f"Invalid Single Frame: {e}") from e
             return UdsMessageRecord([initial_packet])
         if initial_packet.packet_type == CanPacketType.FIRST_FRAME:
+            # Reject functional multi-frame per ISO 14229
+            if initial_packet.addressing_type == AddressingType.FUNCTIONAL:
+                warn("Ignoring First Frame with functional addressing - multi-frame not allowed for functional",
+                     category=UnexpectedPacketReceptionWarning)
+                raise IgnorePacketError("Functional addressing cannot use multi-frame (ISO 14229)")
+            # Validate FF data per ISO 15765-2
+            try:
+                validate_first_frame_data(
+                    addressing_format=self.segmenter.addressing_format,
+                    raw_frame_data=initial_packet.raw_frame_data)
+            except (ValueError, InconsistencyError) as e:
+                warn(f"Ignoring invalid First Frame: {e}",
+                     category=UnexpectedPacketReceptionWarning)
+                raise IgnorePacketError(f"Invalid First Frame: {e}") from e
             return self._receive_consecutive_frames(first_frame=initial_packet,
                                                     timestamp_end=timestamp_end)
         raise NotImplementedError(f"CAN packet of unhandled type was received: {initial_packet.packet_type}")
@@ -597,12 +755,36 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         :param loop: An asyncio event loop used for observing messages.
 
         :raise NotImplementedError: Unhandled CAN packet starting a new CAN message transmission was received.
+        :raise IgnorePacketError: Invalid SF/FF that should be silently ignored per ISO 15765-2.
 
         :return: Record of UDS message received.
         """
         if initial_packet.packet_type == CanPacketType.SINGLE_FRAME:
+            # Validate SF data per ISO 15765-2
+            try:
+                validate_single_frame_data(
+                    addressing_format=self.segmenter.addressing_format,
+                    raw_frame_data=initial_packet.raw_frame_data)
+            except (ValueError, InconsistencyError) as e:
+                warn(f"Ignoring invalid Single Frame (DLC error): {e}",
+                     category=UnexpectedPacketReceptionWarning)
+                raise IgnorePacketError(f"Invalid Single Frame: {e}") from e
             return UdsMessageRecord([initial_packet])
         if initial_packet.packet_type == CanPacketType.FIRST_FRAME:
+            # Reject functional multi-frame per ISO 14229
+            if initial_packet.addressing_type == AddressingType.FUNCTIONAL:
+                warn("Ignoring First Frame with functional addressing - multi-frame not allowed for functional",
+                     category=UnexpectedPacketReceptionWarning)
+                raise IgnorePacketError("Functional addressing cannot use multi-frame (ISO 14229)")
+            # Validate FF data per ISO 15765-2
+            try:
+                validate_first_frame_data(
+                    addressing_format=self.segmenter.addressing_format,
+                    raw_frame_data=initial_packet.raw_frame_data)
+            except (ValueError, InconsistencyError) as e:
+                warn(f"Ignoring invalid First Frame: {e}",
+                     category=UnexpectedPacketReceptionWarning)
+                raise IgnorePacketError(f"Invalid First Frame: {e}") from e
             return await self._async_receive_consecutive_frames(first_frame=initial_packet,
                                                                 timestamp_end=timestamp_end,
                                                                 loop=loop)
@@ -663,6 +845,7 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                                      is_remote_frame=False)
         timestamp_start = time()
         self.network_manager.send(msg=can_frame, timeout=timeout_ms / 1000.)
+        self._log_frame(can_frame.arbitration_id, can_frame.data, 'TX')
         timestamp_sent = time()
         sent_frame = PythonCanMessage(arbitration_id=can_frame.arbitration_id,
                                       is_extended_id=can_frame.is_extended_id,
@@ -746,11 +929,13 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         self.clear_tx_frames_buffers()
         packets_to_send = list(self.segmenter.segmentation(message))
         packet_records = [self.send_packet(packets_to_send.pop(0))]
+        consecutive_wait_count = 0
         while packets_to_send:
             flow_control_record = self._wait_for_flow_control(
                 last_packet_transmission_time=packet_records[-1].transmission_time)
             packet_records.append(flow_control_record)
             if flow_control_record.flow_status == CanFlowStatus.ContinueToSend:
+                consecutive_wait_count = 0  # Reset on CTS
                 cf_number_to_send = len(packets_to_send) if flow_control_record.block_size == 0 \
                     else flow_control_record.block_size
                 delay_between_cf = self.n_cs if self.n_cs is not None \
@@ -762,6 +947,14 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                         fc_transmission_time=flow_control_record.transmission_time))
                 packets_to_send = packets_to_send[cf_number_to_send:]
             elif flow_control_record.flow_status == CanFlowStatus.Wait:
+                # N_WFTmax enforcement per ISO 15765-2
+                if self.n_wft_max is None or self.n_wft_max == 0:
+                    raise InconsistencyError("FC.WAIT received but WAIT is not supported (n_wft_max=0)")
+                consecutive_wait_count += 1
+                if consecutive_wait_count > self.n_wft_max:
+                    raise InconsistencyError(
+                        f"N_WFTmax exceeded: received {consecutive_wait_count} consecutive FC.WAIT "
+                        f"frames (limit: {self.n_wft_max})")
                 continue
             elif flow_control_record.flow_status == CanFlowStatus.Overflow:
                 raise OverflowError("Flow Control with Flow Status `OVERFLOW` was received.")
@@ -791,11 +984,13 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
         self.clear_tx_frames_buffers()
         packets_to_send = list(self.segmenter.segmentation(message))
         packet_records = [await self.async_send_packet(packets_to_send.pop(0), loop=loop)]
+        consecutive_wait_count = 0
         while packets_to_send:
             flow_control_record = await self._async_wait_for_flow_control(
                 last_packet_transmission_time=packet_records[-1].transmission_time)
             packet_records.append(flow_control_record)
             if flow_control_record.flow_status == CanFlowStatus.ContinueToSend:
+                consecutive_wait_count = 0  # Reset on CTS
                 cf_number_to_send = len(packets_to_send) if flow_control_record.block_size == 0 \
                     else flow_control_record.block_size
                 delay_between_cf = self.n_cs if self.n_cs is not None \
@@ -807,6 +1002,14 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                                                             loop=loop))
                 packets_to_send = packets_to_send[cf_number_to_send:]
             elif flow_control_record.flow_status == CanFlowStatus.Wait:
+                # N_WFTmax enforcement per ISO 15765-2
+                if self.n_wft_max is None or self.n_wft_max == 0:
+                    raise InconsistencyError("FC.WAIT received but WAIT is not supported (n_wft_max=0)")
+                consecutive_wait_count += 1
+                if consecutive_wait_count > self.n_wft_max:
+                    raise InconsistencyError(
+                        f"N_WFTmax exceeded: received {consecutive_wait_count} consecutive FC.WAIT "
+                        f"frames (limit: {self.n_wft_max})")
                 continue
             elif flow_control_record.flow_status == CanFlowStatus.Overflow:
                 raise OverflowError("Flow Control with Flow Status `OVERFLOW` was received.")
@@ -862,8 +1065,11 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                     from exception
             # handle received packet
             if CanPacketType.is_initial_packet_type(received_packet.packet_type):
-                return self._message_receive_start(initial_packet=received_packet,
-                                                   timestamp_end=timestamp_end_timeout)
+                try:
+                    return self._message_receive_start(initial_packet=received_packet,
+                                                       timestamp_end=timestamp_end_timeout)
+                except IgnorePacketError:
+                    continue  # Keep waiting for valid initial packet
             warn(message="A CAN packet that does not start UDS message transmission was received.",
                  category=UnexpectedPacketReceptionWarning)
 
@@ -916,8 +1122,11 @@ class PyCanTransportInterface(AbstractCanTransportInterface):
                     from exception
             # handle received packet
             if CanPacketType.is_initial_packet_type(received_packet.packet_type):
-                return await self._async_message_receive_start(initial_packet=received_packet,
-                                                               timestamp_end=timestamp_end_timeout,
-                                                               loop=loop)
+                try:
+                    return await self._async_message_receive_start(initial_packet=received_packet,
+                                                                   timestamp_end=timestamp_end_timeout,
+                                                                   loop=loop)
+                except IgnorePacketError:
+                    continue  # Keep waiting for valid initial packet
             warn(message="A CAN packet that does not start UDS message transmission was received.",
                  category=UnexpectedPacketReceptionWarning)

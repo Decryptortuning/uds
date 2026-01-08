@@ -53,3 +53,18 @@ class MessageTransmissionNotStartedError(TimeoutError):
         Timeout defined by `start_timeout` argument was reached by
         :meth:`~uds.transport_interface.abstract_transport_interface.AbstractTransportInterface.receive_message`
     """
+
+
+class IgnorePacketError(Exception):
+    """
+    A received packet should be ignored per ISO 15765-2.
+
+    This exception is raised when a received CAN packet fails validation but should be silently
+    ignored rather than causing an abort. The receive loop should catch this and continue
+    waiting for valid packets.
+
+    Examples:
+        - First Frame with invalid FF_DL
+        - Single Frame with DLC smaller than expected
+        - First Frame received on functional addressing (ISO 14229 violation)
+    """
