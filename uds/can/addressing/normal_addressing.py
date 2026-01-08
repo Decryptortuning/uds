@@ -27,13 +27,17 @@ class NormalCanAddressingInformation(AbstractCanAddressingInformation):
 
         :raise InconsistencyError: Provided values are not consistent with each other.
         """
-        rx_can_ids = {self.rx_physical_params["can_id"], self.rx_functional_params["can_id"]}
-        tx_can_ids = {self.tx_physical_params["can_id"], self.tx_functional_params["can_id"]}
-        if (self.rx_physical_params["can_id"] in tx_can_ids
-                or self.tx_physical_params["can_id"] in rx_can_ids
-                or self.rx_functional_params["can_id"] in tx_can_ids
-                or self.tx_functional_params["can_id"] in rx_can_ids):
-            raise InconsistencyError("CAN ID used for transmission cannot be used for receiving too.")
+        rx_phys_id = self.rx_physical_params["can_id"]
+        tx_phys_id = self.tx_physical_params["can_id"]
+        tx_func_id = self.tx_functional_params["can_id"]
+        rx_func_id = self.rx_functional_params["can_id"]
+
+        # Disallow physical CAN ID clashes (they must be unique), but allow functional IDs to overlap
+        # so tools can share the same functional ID (e.g. 0x7DF) across TX/RX without tripping validation.
+        if rx_phys_id == tx_phys_id:
+            raise InconsistencyError("CAN ID used for physical transmission cannot be used for physical reception.")
+        if rx_phys_id == tx_func_id or tx_phys_id == rx_func_id:
+            raise InconsistencyError("Physical CAN IDs cannot overlap with opposite-direction functional IDs.")
 
     @classmethod
     def validate_addressing_params(cls,  # type: ignore
